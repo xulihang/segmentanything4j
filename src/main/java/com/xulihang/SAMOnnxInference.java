@@ -1,24 +1,17 @@
 package com.xulihang;
 
 import org.opencv.core.*;
-import org.opencv.core.Point;
 import org.opencv.imgcodecs.Imgcodecs;
 import org.opencv.imgproc.Imgproc;
 import org.opencv.highgui.HighGui;
 import ai.onnxruntime.*;
 
-import javax.imageio.ImageIO;
-import javax.swing.*;
-import java.awt.*;
-import java.awt.image.BufferedImage;
 import java.io.File;
 import java.nio.FloatBuffer;
 import java.util.*;
-import java.util.List;
 
 public class SAMOnnxInference {
     static {
-        // 加载OpenCV本地库
         nu.pattern.OpenCV.loadLocally();
     }
 
@@ -28,28 +21,32 @@ public class SAMOnnxInference {
     private boolean needEmbeddings;
     private String rawInputName;
     private int targetSize = 1024;
-    private float[] mean = {0.485f, 0.456f, 0.406f};
-    private float[] std = {0.229f, 0.224f, 0.225f};
+    private final float[] mean = {0.485f, 0.456f, 0.406f};
+    private final float[] std = {0.229f, 0.224f, 0.225f};
 
     public SAMOnnxInference(String modelPath, String encoderPath) throws OrtException {
         this.env = OrtEnvironment.getEnvironment();
-        this.session = env.createSession(modelPath, new OrtSession.SessionOptions());
 
-        // 检查是否需要image_embeddings
-        List<String> inputNames = new ArrayList<>();
-        for (NodeInfo input : session.getInputInfo().values()) {
-            inputNames.add(input.getName());
-        }
-        needEmbeddings = inputNames.contains("image_embeddings");
+        // 配置Session选项
+        OrtSession.SessionOptions sessionOptions = new OrtSession.SessionOptions();
+        sessionOptions.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT);
+        sessionOptions.setExecutionMode(OrtSession.SessionOptions.ExecutionMode.SEQUENTIAL);
+
+        this.session = env.createSession(modelPath, sessionOptions);
+
+        // 检查输入需求
+        Map<String, NodeInfo> inputInfo = session.getInputInfo();
+        needEmbeddings = inputInfo.containsKey("image_embeddings");
 
         if (needEmbeddings) {
             if (encoderPath == null || !new File(encoderPath).exists()) {
                 throw new RuntimeException("ONNX model expects 'image_embeddings' but no encoder ONNX found.");
             }
-            this.encoderSession = env.createSession(encoderPath, new OrtSession.SessionOptions());
+            this.encoderSession = env.createSession(encoderPath, sessionOptions);
+            System.out.println("Encoder session loaded");
         } else {
-            // 查找原始图像输入名称
-            for (String name : inputNames) {
+            // 查找图像输入名称
+            for (String name : inputInfo.keySet()) {
                 if (name.equals("image") || name.equals("images") ||
                         name.equals("pixel_values") || name.equals("input_image")) {
                     rawInputName = name;
@@ -57,25 +54,27 @@ public class SAMOnnxInference {
                 }
             }
             if (rawInputName == null) {
-                rawInputName = session.getInputNames().iterator().next();
+                rawInputName = inputInfo.keySet().iterator().next();
             }
+            System.out.println("Using raw input name: " + rawInputName);
         }
     }
 
     public static class PreprocessResult {
         public OnnxTensor tensor;
         public float scale;
-        public Size paddedSize;
+        public Size originalSize;
+        public Size resizedSize;
 
-        public PreprocessResult(OnnxTensor tensor, float scale, Size paddedSize) {
+        public PreprocessResult(OnnxTensor tensor, float scale, Size originalSize, Size resizedSize) {
             this.tensor = tensor;
             this.scale = scale;
-            this.paddedSize = paddedSize;
+            this.originalSize = originalSize;
+            this.resizedSize = resizedSize;
         }
     }
 
     public PreprocessResult preprocessForEncoder(Mat image) throws OrtException {
-        int targetSize = this.targetSize;
         int h0 = image.rows();
         int w0 = image.cols();
 
@@ -83,21 +82,24 @@ public class SAMOnnxInference {
         int newW = (int) (w0 * scale);
         int newH = (int) (h0 * scale);
 
+        System.out.printf("Original size: %dx%d, Resized: %dx%d, Scale: %.4f%n",
+                w0, h0, newW, newH, scale);
+
         // 调整大小
         Mat resized = new Mat();
-        Imgproc.resize(image, resized, new Size(newW, newH));
+        Imgproc.resize(image, resized, new Size(newW, newH), 0, 0, Imgproc.INTER_LINEAR);
 
-        // 填充到正方形
+        // 填充到正方形 (右下填充)
         Mat canvas = Mat.zeros(targetSize, targetSize, CvType.CV_8UC3);
         Mat roi = canvas.submat(0, newH, 0, newW);
         resized.copyTo(roi);
 
-        // 转换为float并归一化
+        // 转换为float 0-1
         Mat imgFloat = new Mat();
         canvas.convertTo(imgFloat, CvType.CV_32F, 1.0 / 255.0);
 
-        // 应用归一化
-        List<Mat> channels = new ArrayList<>();
+        // 应用归一化 - 逐通道处理
+        List<Mat> channels = new ArrayList<>(3);
         Core.split(imgFloat, channels);
 
         for (int i = 0; i < 3; i++) {
@@ -111,218 +113,164 @@ public class SAMOnnxInference {
         Mat chw = new Mat();
         Core.transpose(imgFloat, chw);
 
-        // 创建tensor
-        float[][][] tensorData = new float[1][3][targetSize * targetSize];
-        float[] flatData = new float[3 * targetSize * targetSize];
-        chw.get(0, 0, flatData);
-
-        // 重新组织数据为 [1, 3, H, W]
-        for (int c = 0; c < 3; c++) {
-            for (int h = 0; h < targetSize; h++) {
-                for (int w = 0; w < targetSize; w++) {
-                    int srcIdx = c * targetSize * targetSize + h * targetSize + w;
-                    tensorData[0][c][h * targetSize + w] = flatData[srcIdx];
-                }
-            }
-        }
+        // 创建tensor数据 [1, 3, H, W]
+        float[] tensorData = new float[3 * targetSize * targetSize];
+        chw.get(0, 0, tensorData);
 
         long[] shape = {1, 3, (long)targetSize, (long)targetSize};
-        OnnxTensor tensor = OnnxTensor.createTensor(env, FloatBuffer.wrap(flatData), shape);
+        OnnxTensor tensor = OnnxTensor.createTensor(env, FloatBuffer.wrap(tensorData), shape);
 
-        return new PreprocessResult(tensor, scale, new Size(newW, newH));
+        return new PreprocessResult(tensor, scale, new Size(w0, h0), new Size(newW, newH));
     }
 
     public float[][] transformCoords(float[][] coords, Size origSize, float scale) {
         float[][] transformed = new float[coords.length][2];
         for (int i = 0; i < coords.length; i++) {
+            // 注意：Python版本是 coords * scale
             transformed[i][0] = coords[i][0] * scale;
             transformed[i][1] = coords[i][1] * scale;
         }
         return transformed;
     }
 
-    public void showMask(Mat mask, Mat image) {
-        // 创建带透明度的掩码可视化
-        Mat maskColor = new Mat(mask.size(), CvType.CV_8UC3, new Scalar(30, 144, 255));
-        Mat maskAlpha = new Mat(mask.size(), CvType.CV_32F);
-        mask.convertTo(maskAlpha, CvType.CV_32F, 0.6);
-
-        // 将掩码应用到原图
-        Mat result = new Mat();
-        image.copyTo(result);
-
-        for (int i = 0; i < mask.rows(); i++) {
-            for (int j = 0; j < mask.cols(); j++) {
-                if (mask.get(i, j)[0] > 0) {
-                    double[] color = maskColor.get(i, j);
-                    double alpha = maskAlpha.get(i, j)[0];
-                    double[] original = result.get(i, j);
-
-                    double[] blended = {
-                            original[0] * (1 - alpha) + color[0] * alpha,
-                            original[1] * (1 - alpha) + color[1] * alpha,
-                            original[2] * (1 - alpha) + color[2] * alpha
-                    };
-                    result.put(i, j, blended);
-                }
-            }
+    public OnnxTensor getImageEmbeddings(PreprocessResult preprocessed) throws OrtException {
+        if (encoderSession == null) {
+            throw new IllegalStateException("Encoder session not initialized");
         }
 
-        // 显示结果
-        HighGui.imshow("Segmentation Result", result);
-        HighGui.waitKey(0);
+        String inputName = encoderSession.getInputNames().iterator().next();
+        OrtSession.Result result = encoderSession.run(Collections.singletonMap(inputName, preprocessed.tensor));
+
+        OnnxValue embeddingValue = result.get(0);
+        return (OnnxTensor) embeddingValue;
     }
 
-    public void showPoints(float[][] points, float[] labels, Mat image) {
-        Mat result = image.clone();
-
-        for (int i = 0; i < points.length; i++) {
-            Scalar color = labels[i] == 1 ? new Scalar(0, 255, 0) : new Scalar(0, 0, 255);
-            Point pt = new Point(points[i][0], points[i][1]);
-            Imgproc.circle(result, pt, 10, color, -1);
-            Imgproc.circle(result, pt, 10, new Scalar(255, 255, 255), 2);
-        }
-
-        HighGui.imshow("Points", result);
-        HighGui.waitKey(0);
-    }
-
-    public void showBox(float[] box, Mat image) {
-        Mat result = image.clone();
-        Point pt1 = new Point(box[0], box[1]);
-        Point pt2 = new Point(box[2], box[3]);
-        Imgproc.rectangle(result, pt1, pt2, new Scalar(0, 255, 0), 2);
-
-        HighGui.imshow("Box", result);
-        HighGui.waitKey(0);
-    }
-
-    public Mat infer(float[] box, float[][] points, float[] labels, Mat image) throws OrtException {
+    public Mat infer(float[] box, float[][] points, float[] pointLabels, Mat image) throws OrtException {
         // 预处理图像
         PreprocessResult preprocessed = preprocessForEncoder(image);
 
-        // 准备提示点
-        float[][] inputBox = {{box[0], box[1]}, {box[2], box[3]}};
+        // 准备提示数据
+        float[][] inputBoxCoords = {{box[0], box[1]}, {box[2], box[3]}};
         float[] boxLabels = {2, 3};
 
-        float[][] onnxCoord;
-        float[] onnxLabel;
+        // 合并点和框坐标
+        float[][] allCoords;
+        float[] allLabels;
 
         if (points == null || points.length == 0) {
-            onnxCoord = inputBox;
-            onnxLabel = boxLabels;
+            allCoords = inputBoxCoords;
+            allLabels = boxLabels;
         } else {
-            onnxCoord = new float[points.length + 2][2];
-            onnxLabel = new float[points.length + 2];
+            allCoords = new float[points.length + 2][2];
+            allLabels = new float[points.length + 2];
 
-            System.arraycopy(points, 0, onnxCoord, 0, points.length);
-            System.arraycopy(labels, 0, onnxLabel, 0, labels.length);
+            // 复制点
+            System.arraycopy(points, 0, allCoords, 0, points.length);
+            System.arraycopy(pointLabels, 0, allLabels, 0, pointLabels.length);
 
-            onnxCoord[points.length] = inputBox[0];
-            onnxCoord[points.length + 1] = inputBox[1];
-            onnxLabel[points.length] = 2;
-            onnxLabel[points.length + 1] = 3;
+            // 添加框坐标
+            allCoords[points.length] = inputBoxCoords[0];
+            allCoords[points.length + 1] = inputBoxCoords[1];
+            allLabels[points.length] = 2;
+            allLabels[points.length + 1] = 3;
         }
 
-        // 转换坐标
-        float[][] transformedCoords = transformCoords(onnxCoord,
-                new Size(image.cols(), image.rows()), preprocessed.scale);
+        // 转换坐标到预处理后的空间
+        float[][] transformedCoords = transformCoords(allCoords, preprocessed.originalSize, preprocessed.scale);
 
-        // 准备ONNX输入
+        System.out.printf("Transformed coords: %s%n", Arrays.deepToString(transformedCoords));
+
+        // 构建输入字典
         Map<String, OnnxTensor> inputs = new HashMap<>();
 
         if (needEmbeddings) {
-            // 运行编码器获取embeddings
-            OrtSession.Result encoderResult = encoderSession.run(
-                    Collections.singletonMap(encoderSession.getInputNames().iterator().next(),
-                            preprocessed.tensor));
-            OnnxValue embeddingValue = encoderResult.get(0);
-            inputs.put("image_embeddings", (OnnxTensor) embeddingValue);
+            OnnxTensor embeddings = getImageEmbeddings(preprocessed);
+            inputs.put("image_embeddings", embeddings);
         } else {
             inputs.put(rawInputName, preprocessed.tensor);
         }
 
-        // 添加点坐标和标签
-        float[][][] coordInput = {transformedCoords};
-        float[][] labelInput = {onnxLabel};
-
-        long[] coordShape = {1, (long)transformedCoords.length, 2};
-        long[] labelShape = {1, (long)onnxLabel.length};
-
-        FloatBuffer coordBuffer = FloatBuffer.allocate(transformedCoords.length * 2);
+        // 准备点坐标输入 [1, N, 2]
+        float[][][] pointCoordsArray = {transformedCoords};
+        long[] pointCoordsShape = {1, (long)transformedCoords.length, 2};
+        FloatBuffer pointCoordsBuffer = FloatBuffer.allocate(transformedCoords.length * 2);
         for (float[] coord : transformedCoords) {
-            coordBuffer.put(coord);
+            pointCoordsBuffer.put(coord);
         }
-        coordBuffer.rewind();
+        pointCoordsBuffer.rewind();
+        inputs.put("point_coords", OnnxTensor.createTensor(env, pointCoordsBuffer, pointCoordsShape));
 
-        FloatBuffer labelBuffer = FloatBuffer.allocate(onnxLabel.length);
-        labelBuffer.put(onnxLabel);
-        labelBuffer.rewind();
+        // 准备点标签输入 [1, N]
+        float[][] pointLabelsArray = {allLabels};
+        long[] pointLabelsShape = {1, (long)allLabels.length};
+        FloatBuffer pointLabelsBuffer = FloatBuffer.allocate(allLabels.length);
+        for (float label : allLabels) {
+            pointLabelsBuffer.put(label);
+        }
+        pointLabelsBuffer.rewind();
+        inputs.put("point_labels", OnnxTensor.createTensor(env, pointLabelsBuffer, pointLabelsShape));
 
-        inputs.put("point_coords", OnnxTensor.createTensor(env, coordBuffer, coordShape));
-        inputs.put("point_labels", OnnxTensor.createTensor(env, labelBuffer, labelShape));
+        // 掩码输入 [1, 1, 256, 256] - 全零
+        float[] maskInputData = new float[1 * 1 * 256 * 256];
+        long[] maskInputShape = {1, 1, 256, 256};
+        inputs.put("mask_input", OnnxTensor.createTensor(env,
+                FloatBuffer.wrap(maskInputData), maskInputShape));
 
-        // 添加掩码输入
-        float[][][][] maskInput = new float[1][1][256][256];
-        long[] maskShape = {1, 1, 256, 256};
-        FloatBuffer maskBuffer = FloatBuffer.allocate(1 * 1 * 256 * 256);
-        inputs.put("mask_input", OnnxTensor.createTensor(env, maskBuffer, maskShape));
-
-        // 添加has_mask_input
+        // has_mask_input [1] - 零
         float[] hasMaskInput = {0};
         long[] hasMaskShape = {1};
         inputs.put("has_mask_input", OnnxTensor.createTensor(env,
                 FloatBuffer.wrap(hasMaskInput), hasMaskShape));
 
-        // 添加原始图像尺寸
-        float[] origSize = {image.rows(), image.cols()};
-        long[] origSizeShape = {2};
+        // 原始图像尺寸 [2]
+        float[] origImSize = {(float)preprocessed.originalSize.height, (float)preprocessed.originalSize.width};
+        long[] origImSizeShape = {2};
         inputs.put("orig_im_size", OnnxTensor.createTensor(env,
-                FloatBuffer.wrap(origSize), origSizeShape));
+                FloatBuffer.wrap(origImSize), origImSizeShape));
+
+        System.out.println("Running inference with inputs: " + inputs.keySet());
 
         // 运行推理
+        long startTime = System.currentTimeMillis();
         OrtSession.Result results = session.run(inputs);
-        OnnxValue maskValue = results.get(0);
-        // 修复mask处理逻辑
-        Mat mask = processMaskOutput(maskValue, image.size());
+        long endTime = System.currentTimeMillis();
+        System.out.printf("Inference time: %d ms%n", endTime - startTime);
+
+        // 处理输出
+        OnnxValue masksValue = results.get(0);
+        Mat mask = processMaskOutput(masksValue, preprocessed.originalSize);
+
+        // 清理tensor
+        for (OnnxTensor tensor : inputs.values()) {
+            tensor.close();
+        }
+        preprocessed.tensor.close();
 
         return mask;
     }
 
-    private Mat processMaskOutput(OnnxValue maskValue, Size originalSize) throws OrtException {
-        // 获取mask数据
-        Object value = maskValue.getValue();
-        Mat mask = new Mat();
+    private Mat processMaskOutput(OnnxValue masksValue, Size originalSize) throws OrtException {
+        Object value = masksValue.getValue();
+        Mat mask;
 
         if (value instanceof float[][][][]) {
             float[][][][] maskData = (float[][][][]) value;
-            int batchSize = maskData.length;
-            int channels = maskData[0].length;
+            int batch = maskData.length;
+            int channel = maskData[0].length;
             int height = maskData[0][0].length;
             int width = maskData[0][0][0].length;
 
-            // 通常我们取第一个batch和第一个channel
+            System.out.printf("Mask shape: [%d, %d, %d, %d]%n", batch, channel, height, width);
+
+            // 取第一个batch和channel
             mask = new Mat(height, width, CvType.CV_32F);
             for (int i = 0; i < height; i++) {
                 for (int j = 0; j < width; j++) {
                     mask.put(i, j, maskData[0][0][i][j]);
                 }
             }
-
-        } else if (value instanceof float[][][]) {
-            float[][][] maskData = (float[][][]) value;
-            int batchSize = maskData.length;
-            int height = maskData[0].length;
-            int width = maskData[0][0].length;
-
-            mask = new Mat(height, width, CvType.CV_32F);
-            for (int i = 0; i < height; i++) {
-                for (int j = 0; j < width; j++) {
-                    mask.put(i, j, maskData[0][i][j]);
-                }
-            }
         } else {
-            throw new RuntimeException("Unknown mask output format");
+            throw new RuntimeException("Unexpected mask output format: " + value.getClass());
         }
 
         // 应用阈值
@@ -330,13 +278,15 @@ public class SAMOnnxInference {
         Mat binaryMask = new Mat();
         Core.compare(mask, new Scalar(maskThreshold), binaryMask, Core.CMP_GT);
 
-        // 转换为8位
+        // 转换为8UC1
         Mat mask8u = new Mat();
-        binaryMask.convertTo(mask8u, CvType.CV_8U, 255);
+        binaryMask.convertTo(mask8u, CvType.CV_8UC1, 255);
 
-        // 调整到原始图像尺寸
+        // 调整到原始尺寸 - 使用最近邻插值
         Mat resizedMask = new Mat();
-        Imgproc.resize(mask8u, resizedMask, originalSize, 0, 0, Imgproc.INTER_NEAREST);
+        Imgproc.resize(mask8u, resizedMask,
+                new Size(originalSize.width, originalSize.height),
+                0, 0, Imgproc.INTER_NEAREST);
 
         return resizedMask;
     }

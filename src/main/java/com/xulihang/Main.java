@@ -29,7 +29,7 @@ public class Main {
             Imgproc.cvtColor(image, imageRGB, Imgproc.COLOR_BGR2RGB);
 
             // 示例1: 使用边界框进行推理
-            float[] box1 = {210, 200, 350, 500};
+            float[] box1 = {380, 230, 480, 520};
             float[][] points1 = {}; // 空点
             float[] labels1 = {};
 
