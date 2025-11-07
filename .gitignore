@@ -40,3 +40,4 @@ build/
 *.png
 *.jpg
 *.dll
+out

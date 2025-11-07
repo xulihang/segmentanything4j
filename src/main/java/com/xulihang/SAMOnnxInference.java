@@ -192,74 +192,15 @@ public class SAMOnnxInference {
         return (OnnxTensor) embeddingValue;
     }
 
-    public Mat infer(float[] box, float[][] points, float[] pointLabels, Mat image) throws OrtException {
+    public Mat infer(List<float[]> boxes, float[][] points, float[] pointLabels, Mat image) throws OrtException {
         // 预处理图像
         PreprocessResult preprocessed = preprocessForEncoder(image);
-
-        // 准备提示数据 - 确保与Python版本的格式完全一致
-        float[][] inputBoxCoords = {{box[0], box[1]}, {box[2], box[3]}};
-        float[] boxLabels = {2, 3};
-
-        // 合并点和框坐标
-        float[][] allCoords;
-        float[] allLabels;
-
-        if (points == null || points.length == 0) {
-            allCoords = inputBoxCoords;
-            allLabels = boxLabels;
-        } else {
-            allCoords = new float[points.length + 2][2];
-            allLabels = new float[points.length + 2];
-
-            // 复制点
-            System.arraycopy(points, 0, allCoords, 0, points.length);
-            System.arraycopy(pointLabels, 0, allLabels, 0, pointLabels.length);
-
-            // 添加框坐标
-            allCoords[points.length] = inputBoxCoords[0];
-            allCoords[points.length + 1] = inputBoxCoords[1];
-            allLabels[points.length] = 2;
-            allLabels[points.length + 1] = 3;
-        }
-
-        // 转换坐标到预处理后的空间
-        float[][] transformedCoords = transformCoords(allCoords, preprocessed.originalSize, preprocessed.scale);
-
-        //System.out.printf("Transformed coords: %s%n", Arrays.deepToString(transformedCoords));
-
-        // 构建输入字典 - 更灵活地处理不同的输入名称
+        OnnxTensor embeddings = null;
+        Mat mergedMask = Mat.zeros(image.size(), CvType.CV_8UC1);
         Map<String, OnnxTensor> inputs = new HashMap<>();
-
         if (needEmbeddings) {
-            OnnxTensor embeddings = getImageEmbeddings(preprocessed);
-            inputs.put("image_embeddings", embeddings);
-        } else {
-            inputs.put(rawInputName, preprocessed.tensor);
+            embeddings = getImageEmbeddings(preprocessed);
         }
-
-        // 准备点坐标输入 [1, N, 2] - 支持多种可能的输入名称
-        String pointCoordsName = "point_coords";
-        float[][][] pointCoordsArray = {transformedCoords};
-        long[] pointCoordsShape = {1, (long)transformedCoords.length, 2};
-        FloatBuffer pointCoordsBuffer = FloatBuffer.allocate(transformedCoords.length * 2);
-        for (float[] coord : transformedCoords) {
-            pointCoordsBuffer.put(coord[0]);
-            pointCoordsBuffer.put(coord[1]);
-        }
-        pointCoordsBuffer.rewind();
-        inputs.put(pointCoordsName, OnnxTensor.createTensor(env, pointCoordsBuffer, pointCoordsShape));
-
-        // 准备点标签输入 [1, N] - 支持多种可能的输入名称
-        String pointLabelsName = "point_labels";
-        float[][] pointLabelsArray = {allLabels};
-        long[] pointLabelsShape = {1, (long)allLabels.length};
-        FloatBuffer pointLabelsBuffer = FloatBuffer.allocate(allLabels.length);
-        for (float label : allLabels) {
-            pointLabelsBuffer.put(label);
-        }
-        pointLabelsBuffer.rewind();
-        inputs.put(pointLabelsName, OnnxTensor.createTensor(env, pointLabelsBuffer, pointLabelsShape));
-
         // 掩码输入 [1, 1, 256, 256] - 全零
         String maskInputName = "mask_input";
         float[] maskInputData = new float[1 * 1 * 256 * 256];
@@ -281,45 +222,120 @@ public class SAMOnnxInference {
         inputs.put(origImSizeName, OnnxTensor.createTensor(env,
                 FloatBuffer.wrap(origImSize), origImSizeShape));
 
-        // 检查并适应模型的实际输入名称
-        Map<String, NodeInfo> inputInfo = session.getInputInfo();
-        Map<String, OnnxTensor> adaptedInputs = new HashMap<>();
-        
-        for (String name : inputInfo.keySet()) {
-            if (inputs.containsKey(name)) {
-                adaptedInputs.put(name, inputs.get(name));
-            } else if (name.contains("point_coords")) {
-                adaptedInputs.put(name, inputs.get(pointCoordsName));
-            } else if (name.contains("point_labels")) {
-                adaptedInputs.put(name, inputs.get(pointLabelsName));
-            } else if (name.contains("mask_input")) {
-                adaptedInputs.put(name, inputs.get(maskInputName));
-            } else if (name.contains("has_mask_input")) {
-                adaptedInputs.put(name, inputs.get(hasMaskInputName));
-            } else if (name.contains("orig_im_size") || name.contains("original_size")) {
-                adaptedInputs.put(name, inputs.get(origImSizeName));
+        for (float[] box:boxes) {
+            // 准备提示数据 - 确保与Python版本的格式完全一致
+            float[][] inputBoxCoords = {{box[0], box[1]}, {box[2], box[3]}};
+            float[] boxLabels = {2, 3};
+
+            // 合并点和框坐标
+            float[][] allCoords;
+            float[] allLabels;
+
+            if (points == null || points.length == 0) {
+                allCoords = inputBoxCoords;
+                allLabels = boxLabels;
+            } else {
+                allCoords = new float[points.length + 2][2];
+                allLabels = new float[points.length + 2];
+
+                // 复制点
+                System.arraycopy(points, 0, allCoords, 0, points.length);
+                System.arraycopy(pointLabels, 0, allLabels, 0, pointLabels.length);
+
+                // 添加框坐标
+                allCoords[points.length] = inputBoxCoords[0];
+                allCoords[points.length + 1] = inputBoxCoords[1];
+                allLabels[points.length] = 2;
+                allLabels[points.length + 1] = 3;
+            }
+
+            // 转换坐标到预处理后的空间
+            float[][] transformedCoords = transformCoords(allCoords, preprocessed.originalSize, preprocessed.scale);
+
+            //System.out.printf("Transformed coords: %s%n", Arrays.deepToString(transformedCoords));
+            // 构建输入字典 - 更灵活地处理不同的输入名称
+
+            if (needEmbeddings && embeddings != null) {
+                inputs.put("image_embeddings", embeddings);
+            } else {
+                inputs.put(rawInputName, preprocessed.tensor);
+            }
+            // 准备点坐标输入 [1, N, 2] - 支持多种可能的输入名称
+            String pointCoordsName = "point_coords";
+            float[][][] pointCoordsArray = {transformedCoords};
+            long[] pointCoordsShape = {1, (long)transformedCoords.length, 2};
+            FloatBuffer pointCoordsBuffer = FloatBuffer.allocate(transformedCoords.length * 2);
+            for (float[] coord : transformedCoords) {
+                pointCoordsBuffer.put(coord[0]);
+                pointCoordsBuffer.put(coord[1]);
+            }
+            pointCoordsBuffer.rewind();
+            OnnxTensor pointsCoordsTensor = OnnxTensor.createTensor(env, pointCoordsBuffer, pointCoordsShape);
+            inputs.put(pointCoordsName, pointsCoordsTensor);
+
+            // 准备点标签输入 [1, N] - 支持多种可能的输入名称
+            String pointLabelsName = "point_labels";
+            float[][] pointLabelsArray = {allLabels};
+            long[] pointLabelsShape = {1, (long)allLabels.length};
+            FloatBuffer pointLabelsBuffer = FloatBuffer.allocate(allLabels.length);
+            for (float label : allLabels) {
+                pointLabelsBuffer.put(label);
+            }
+            pointLabelsBuffer.rewind();
+            OnnxTensor pointLabelsTensor = OnnxTensor.createTensor(env, pointLabelsBuffer, pointLabelsShape);
+            inputs.put(pointLabelsName, pointLabelsTensor);
+
+            // 检查并适应模型的实际输入名称
+            Map<String, NodeInfo> inputInfo = session.getInputInfo();
+            Map<String, OnnxTensor> adaptedInputs = new HashMap<>();
+
+            for (String name : inputInfo.keySet()) {
+                if (inputs.containsKey(name)) {
+                    adaptedInputs.put(name, inputs.get(name));
+                } else if (name.contains("point_coords")) {
+                    adaptedInputs.put(name, inputs.get(pointCoordsName));
+                } else if (name.contains("point_labels")) {
+                    adaptedInputs.put(name, inputs.get(pointLabelsName));
+                } else if (name.contains("mask_input")) {
+                    adaptedInputs.put(name, inputs.get(maskInputName));
+                } else if (name.contains("has_mask_input")) {
+                    adaptedInputs.put(name, inputs.get(hasMaskInputName));
+                } else if (name.contains("orig_im_size") || name.contains("original_size")) {
+                    adaptedInputs.put(name, inputs.get(origImSizeName));
+                }
+            }
+
+            //System.out.println("Running inference with inputs: " + adaptedInputs.keySet());
+
+            // 运行推理
+            long startTime = System.currentTimeMillis();
+            OrtSession.Result results = session.run(adaptedInputs);
+            long endTime = System.currentTimeMillis();
+            //System.out.printf("Inference time: %d ms%n", endTime - startTime);
+
+            // 处理输出
+            OnnxValue masksValue = results.get(0);
+            Mat mask = processMaskOutput(masksValue, preprocessed.originalSize);
+            Core.bitwise_or(mergedMask, mask, mergedMask);
+            pointLabelsTensor.close();
+            pointsCoordsTensor.close();
+            inputs.remove("point_coords");
+            inputs.remove("point_labels");
+        }
+
+
+        // 清理tensor
+        if (preprocessed != null && preprocessed.tensor != null) {
+            preprocessed.tensor.close();
+        }
+        for (OnnxTensor tensor : inputs.values()) {
+            if (tensor != null) {
+                tensor.close();
             }
         }
 
-        //System.out.println("Running inference with inputs: " + adaptedInputs.keySet());
 
-        // 运行推理
-        long startTime = System.currentTimeMillis();
-        OrtSession.Result results = session.run(adaptedInputs);
-        long endTime = System.currentTimeMillis();
-        //System.out.printf("Inference time: %d ms%n", endTime - startTime);
-
-        // 处理输出
-        OnnxValue masksValue = results.get(0);
-        Mat mask = processMaskOutput(masksValue, preprocessed.originalSize);
-
-        // 清理tensor
-        for (OnnxTensor tensor : inputs.values()) {
-            tensor.close();
-        }
-        preprocessed.tensor.close();
-
-        return mask;
+        return mergedMask;
     }
 
     private Mat processMaskOutput(OnnxValue masksValue, Size originalSize) throws OrtException {
