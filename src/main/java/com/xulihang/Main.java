@@ -1,5 +1,6 @@
 package com.xulihang;
 
+import org.opencv.core.Core;
 import org.opencv.core.Mat;
 import org.opencv.imgcodecs.Imgcodecs;
 import org.opencv.imgproc.Imgproc;
@@ -7,8 +8,9 @@ import org.opencv.imgproc.Imgproc;
 public class Main {
     public static void main(String[] args) {
         try {
-            // 模型路径
-            String decoderModelPath = "decoder.onnx";
+            System.loadLibrary(Core.NATIVE_LIBRARY_NAME);
+            // 模型路径 - 使用与Python版本相同的模型文件
+            String decoderModelPath = "decoder.quant.onnx";
             String encoderModelPath = "encoder.onnx"; // 如果需要
 
             // 图像路径
@@ -28,18 +30,25 @@ public class Main {
             Mat imageRGB = new Mat();
             Imgproc.cvtColor(image, imageRGB, Imgproc.COLOR_BGR2RGB);
 
-            // 示例1: 使用边界框进行推理
-            float[] box1 = {380, 230, 480, 520};
+            // 示例1: 使用与Python版本相同的边界框进行推理
+            float[] box1 = {210, 200, 350, 500};
             float[][] points1 = {}; // 空点
             float[] labels1 = {};
 
-            System.out.println("运行第一个推理...");
+            //System.out.println("运行第一个推理...");
             Mat mask1 = sam.infer(box1, points1, labels1, imageRGB);
-            Imgcodecs.imwrite("out.png",mask1);
-            //sam.showMask(mask1, imageRGB);
-            //sam.showBox(box1, imageRGB);
+            Imgcodecs.imwrite("out1.png", mask1);
+            //System.out.println("第一个掩码已保存为 out1.png");
 
+            // 示例2: 使用与Python版本相同的第二个边界框进行推理
+            float[] box2 = {380, 230, 480, 520};
+            float[][] points2 = {}; // 空点
+            float[] labels2 = {};
 
+            //System.out.println("运行第二个推理...");
+            Mat mask2 = sam.infer(box2, points2, labels2, imageRGB);
+            Imgcodecs.imwrite("out2.png", mask2);
+            //System.out.println("第二个掩码已保存为 out2.png");
 
             // 清理资源
             sam.close();
